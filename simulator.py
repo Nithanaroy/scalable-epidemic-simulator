@@ -16,6 +16,9 @@ from bokeh.io import output_notebook
 # from holoviews.operation.datashader import datashade, shade, dynspread, rasterize
 from holoviews.operation import decimate
 from holoviews import opts, Cycle
+import streamz
+from holoviews.streams import Pipe, Buffer
+from time import sleep
 
 import pandas as pd
 from pathlib import Path
@@ -40,6 +43,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s: %(levelname)s %(fil
 hv.extension('bokeh')
 renderer = hv.renderer('bokeh')
 output_notebook()
+
+
+from holoviews.core.options import SkipRendering
 
 
 def dict_as_str(d:Dict[str, Any], custom_str_repr:Dict[str, Callable]={}):
@@ -79,6 +85,9 @@ class CityConfig:
         self.rm_frequencies, self.rm_travel_distances = resident_mobility_freq_cohorts, resident_mobility_dist_cohorts
         
     def __repr__(self):
+        return dict_as_str(self.__dict__)
+    
+    def __str__(self):
         return dict_as_str(self.__dict__)
 
 
@@ -129,6 +138,7 @@ class Resident:
         self.health, self.ec, self.cc = rh, ec, cc
         self.move_freq, self.move_dist_range= move_freq, move_dist_range
         self.loc_hist:List[Tuple[datetime.datetime, float, float]] = []
+        self._loc_hist_replay_stream = None
     
     def _valid_coords(self, x:float, y:float):
         """Check if resident is at a valid location"""
@@ -137,6 +147,9 @@ class Resident:
 
     def location(self):
         return self._x_pos, self._y_pos
+    
+    def as_df(self):
+        return pd.DataFrame([self.__dict__]).drop(columns=["ec", "cc", "loc_hist"]).astype("str")
     
     def move_to(self, new_x:float, new_y:float, date:datetime.datetime):
         if self._valid_coords(new_x, new_y):
@@ -159,6 +172,8 @@ class Resident:
         return self.infected != HealthStateEnum.DEAD
     
     def infect(self, date:datetime.datetime):
+        if not self.is_alive():
+            return
         self.infected = HealthStateEnum.INFECTED
         self.infected_since = date
         
@@ -167,6 +182,8 @@ class Resident:
         
     def cure(self, date:datetime.datetime, epidemic_config:EpidemicConfig):
         """Returns true if the resident was successfully cured"""
+        if not self.is_alive():
+            return
         duration_since_infected = date - self.infected_since
         if self.is_infected() and duration_since_infected >= epidemic_config.recover_after:
             if self._did_recover():
@@ -189,8 +206,10 @@ class Resident:
             move_prob can be used to select the day of move during the week
         :return True if state of the resident changed or False otherwise
         """
+        if not self.is_alive():
+            return False
         last_moved_on, _, _ = self.loc_hist[-1]
-        if last_moved_on + self.move_freq < current_date and random.random() <= move_prob and self._move_to_rand(current_date):
+        if last_moved_on + self.move_freq <= current_date and random.random() <= move_prob and self._move_to_rand(current_date):
             return True # as the resident moved this time
         return False
         
@@ -206,30 +225,46 @@ class Resident:
             if move_ok:
                 return True
         return False
-
-
-class EpidemicCurve:
-    def __init__(self):
-        self.trend:List[Dict[str, float]] = []
-            
-    def log_stats(self, date:datetime, stats:Dict[str, float]):
-        log = {"date": date}
-        log.update(stats)
-        self.trend.append(log)
     
-    def visualize_time_series(self, stats:List[str], rename_cols:Dict[str, str]=dict(), options:opts=opts()):
+    def initialize_loc_history_replay(self):
+        self._loc_hist_replay_stream = Buffer(pd.DataFrame({
+            "x": pd.Series([], dtype=float), 
+            "y": pd.Series([], dtype=float), 
+            "Name": pd.Series([], dtype=str), 
+            "Date": pd.Series([], dtype=str)
+        }), length=100, index=False)
+        
+        loc_dmap = hv.DynamicMap(partial(hv.Points, vdims=["Name", "Date"]), streams=[self._loc_hist_replay_stream])
+        trace_dmap = hv.DynamicMap(partial(hv.Curve), streams=[self._loc_hist_replay_stream])
+        # title_dmap = hv.DynamicMap(partial(hv.Text, x=13, y=13, text="Hello", vdims=["Date", "Name", "timestamp"], streams=[self._loc_hist_replay_stream]))
+        
+        print("Now call start_loc_history_replay() whenever you are ready")
+        return (loc_dmap * trace_dmap).                    opts(ylim=(0, self.cc.breadth + 2), xlim=(0, self.cc.length + 2), 
+                         show_legend=False).\
+                    opts(opts.Points(size=6, tools=["hover"], color="Date", cmap="Blues"))
+    
+    def start_loc_history_replay(self, complete_within_sec:float=10):
         """
-        Plots the given stats over a period of a time
-        :param stats: names of statistics to plot
-        :param rename_cols: any human readable names for the statistics
-        :param options: plotting options for holoviews
+        :param complete_within_sec: adjusts the playback speed accordingly
         """
-        df = pd.DataFrame(self.trend).fillna(0)
-        stats = list(map(lambda s: rename_cols.get(s, s), df.columns & stats))
-        df = df.rename(columns=rename_cols)
-        point_curves = [hv.Scatter(df[["date", statistic]], label=statistic) for statistic in stats]
-        line_curves = [hv.Curve(points) for points in point_curves]
-        return (hv.Overlay(line_curves + point_curves)).                    opts(opts.Scatter(tools=["hover"], size=6)).                    opts(padding=0.05, height=375, legend_position="bottom", title="").                    opts(options)
+        self._loc_hist_replay_stream.clear()
+        playback_speed = complete_within_sec / len(self.loc_hist)
+        for date, x, y in self.loc_hist:
+            sleep(playback_speed)            
+            self._loc_hist_replay_stream.send(pd.DataFrame([
+                (x, y, self.name, date.strftime("%c"))
+            ], columns=["x", "y", "Name", "Date"]))
+    
+    def visualize_loc_history(self):
+        df = pd.DataFrame(self.loc_hist, columns=["date", "x", "y"])
+        df["date"] = df["date"].apply(lambda d: d.strftime("%c"))
+
+        scatter = hv.Scatter(df,
+            kdims=["x", "y"], vdims=["date", "date"]).\
+            opts(tools=["hover"], color="date", cmap="Blues", size=6, padding=0.05, legend_position="bottom")
+        line = hv.Curve(scatter, label="path")
+        table = hv.Table(self.as_df().T.reset_index().rename(columns={"index": "Field", 0: "Details"}))
+        return table + (line * scatter).opts(width=500, height=500, xlim=(0, self.cc.length), ylim=(0, self.cc.breadth))
 
 
 class City:
@@ -307,7 +342,7 @@ class City:
         for resident in self.residents:
             if resident.cure(self.current_date, self.epidemic_config):
                 recovered_cases.append(resident)
-            elif not resident.is_alive():
+            elif resident.died_on == self.current_date:
                 deceased_cases.append(resident)
         return recovered_cases, deceased_cases
     
@@ -341,6 +376,37 @@ class City:
         return population_scatter
 
 
+class EpidemicCurve:
+    def __init__(self):
+        self.trend:List[Dict[str, float]] = []
+            
+    def log_stats(self, date:datetime, stats:Dict[str, float]):
+        log = {"date": date}
+        log.update(stats)
+        self.trend.append(log)
+    
+    def visualize_time_series(self, stats:List[str], rename_cols:Dict[str, str]=dict(), options:opts=opts()):
+        """
+        Plots the given stats over a period of a time
+        :param stats: names of statistics to plot
+        :param rename_cols: any human readable names for the statistics
+        :param options: plotting options for holoviews
+        """
+        df = pd.DataFrame(self.trend).fillna(0)
+        stats = list(map(lambda s: rename_cols.get(s, s), df.columns & stats))
+        df = df.rename(columns=rename_cols)
+        point_curves = [hv.Scatter(df[["date", statistic]], label=statistic) for statistic in stats]
+        line_curves = [hv.Curve(points) for points in point_curves]
+        return (hv.Overlay(line_curves + point_curves)).                    opts(opts.Scatter(tools=["hover"], size=6)).                    opts(padding=0.05, height=375, legend_position="bottom", title="").                    opts(options)
+    
+    def visualize_recent_residents_moved(self, options:opts=opts()):
+        default_options = opts(title="A sample of residents who moved")
+        df = pd.DataFrame(self.trend[-1].get('state_changed_sample', []), columns=["resident"])
+        if df.shape[0] == 0:
+            return hv.Table([], ["Names of a few"]).opts(default_options).opts(options)
+        return hv.Table((df.apply(lambda row: row['resident'].name, axis=1),), ["Names of a few"]).opts(default_options).opts(options)
+
+
 class Simulator:
     def __init__(self, city:City, start_date:datetime):
         self.city = city
@@ -355,10 +421,12 @@ class Simulator:
     def progress_time(self, inc_by:datetime.timedelta):
         changes = self.city.progress_time(inc_by)
         self.current_date += inc_by
-        self.curve.log_stats(self.current_date, self.city_stats(changes))
+        all_stats = self.city_stats(changes)
+        self.curve.log_stats(self.current_date, all_stats)
+        return all_stats
     
     def visualize(self):
-        daily_plot_cols_labels = {"INFECTED": "Infected", "RECOVERED": "Recovered"}
+        daily_plot_cols_labels = {"INFECTED": "Infected", "RECOVERED": "Recovered", "DEAD": "dead"}
         change_plot_cols_labels = {
             "num_recovered_cases": "# newly recovered",
             "num_deceased_cases": "# of new deaths",
@@ -367,37 +435,85 @@ class Simulator:
         mobility_plot_cols_labels = {
             "num_state_changed": "# of residents moved" # NOTE: Only people moving is considered a state change as of today
         }
-        gspec = pn.GridSpec(sizing_mode='stretch_both')
+        gspec = pn.GridSpec(width=975, margin=0, sizing_mode="stretch_both")
         mobility_plot = self.curve.visualize_time_series(mobility_plot_cols_labels.keys(), 
             rename_cols=mobility_plot_cols_labels, 
-            options=opts(title="∆ in number of residents moved", ylabel="Periodic change", height=300, width=500, show_legend=False))
+            options=opts(title="∆ in number of residents moved", ylabel="Periodic change", height=300, show_legend=False))
         daily_plot = self.curve.visualize_time_series(daily_plot_cols_labels.keys(), 
             rename_cols=daily_plot_cols_labels, 
-            options=opts(ylabel="Total residents as of date", width=475))
+            options=opts(ylabel="Total as of date"))
         change_plot = self.curve.visualize_time_series(change_plot_cols_labels.keys(), 
             rename_cols=change_plot_cols_labels,
-            options=opts(ylabel="Periodic change in metric", width=475))
-        
-        gspec[0, :2] = (self.city.visualize() + mobility_plot).opts(shared_axes=False)
-        gspec[1, :2] = (daily_plot + change_plot).opts(shared_axes=False)
+            options=opts(ylabel="Periodic change in metric"))
+
+        gspec[0, 0:2] = self.city.visualize()
+        gspec[0, 2:5] = mobility_plot
+        gspec[0, 5] = self.curve.visualize_recent_residents_moved(opts(width=100, title=""))
+        gspec[1, :3] = daily_plot
+        gspec[1, 3:] = change_plot        
+            
         return gspec
+    
 
 
 start_date = datetime.datetime.strptime("2020-03-01", "%Y-%m-%d")
-resident_mobility_freq_cohorts = [datetime.timedelta(days=1), datetime.timedelta(days=2), datetime.timedelta(days=7)]
+# resident_mobility_freq_cohorts = [datetime.timedelta(days=1), datetime.timedelta(days=2), datetime.timedelta(days=7)]
+resident_mobility_freq_cohorts = [datetime.timedelta(days=1)]
 resident_mobility_dist_cohorts = [(1, 2), (2, 3), (2, 5)]
 
 sunnyvale_config = CityConfig(100, 144, resident_mobility_freq_cohorts, resident_mobility_dist_cohorts)
-corona_config = EpidemicConfig(5, start_date)
+corona_config = EpidemicConfig(10, start_date, infection_radius=1, recover_after=datetime.timedelta(days=14), decease_after=datetime.timedelta(days=14))
 sunnyvale = City(sunnyvale_config, corona_config)
 
 
 sunnyvale_toy_simulator = Simulator(sunnyvale, start_date)
-sunnyvale_toy_simulator.visualize()
+# sunnyvale_toy_simulator.visualize() # TODO: SkipRendering Exception
 
 
-sunnyvale_toy_simulator.progress_time(datetime.timedelta(days=1))
-sunnyvale_toy_simulator.visualize()
+get_ipython().run_cell_magic('time', '', 'for i in range(30):\n    stats = sunnyvale_toy_simulator.progress_time(datetime.timedelta(days=1))\n    if stats.get("INFECTED", 0) == 0:\n        break\n\nsunnyvale_toy_simulator.visualize()')
+
+
+name_tb = pn.widgets.TextInput(value="80")
+wb = pn.WidgetBox(pn.widgets.StaticText(value="Resident name"), name_tb)
+
+@pn.depends(name=name_tb.param.value)
+def resident_location_dashboard(name):
+    return next(filter(lambda r: r.name == name, sunnyvale.residents)).visualize_loc_history()
+
+dmap = hv.DynamicMap(resident_location_dashboard)
+
+pn.Column(wb, dmap)
+
+
+resident_name = '8'
+resident = next(filter(lambda r: r.name == resident_name, sunnyvale.residents))
+resident.initialize_loc_history_replay()
+
+
+resident.start_loc_history_replay(10)
+
+
+try:
+#             gspec[0, 2:5] = mobility_plot
+#             gspec[0, 5] = self.curve.visualize_recent_residents_moved(opts(width=100, title=""))
+            pass
+        except Exception as e: # SkipRendering Excepion for empty plot
+            gspec[0, 2:] = pn.Spacer(background='white', margin=0)
+        try:
+#             gspec[1, 3:] = change_plot        
+            pass
+        except Exception as e:
+            gspec[1, 3:] = pn.Spacer(background='white', margin=0)
+
+
+gspec = pn.GridSpec(sizing_mode="stretch_both", background="pink")
+gspec[0, :2] = pn.Spacer(background='red',    margin=0)
+gspec[0, 2:5] = pn.Spacer(background='green',    margin=0)
+gspec[0, 5] = pn.Spacer(background='orange',    margin=0)
+gspec[1, :3] = pn.Spacer(background='blue',   margin=0)
+gspec[1, 3:] = pn.Spacer(background='purple', margin=0)
+
+gspec
 
 
 e = EpidemicCurve()
